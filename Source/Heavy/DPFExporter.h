@@ -28,7 +28,7 @@ public:
     {
         Array<PropertiesPanelProperty*> properties;
         properties.add(new PropertiesPanel::EditableComponent<String>("Maker Name (optional)", makerNameValue));
-        properties.add(new PropertiesPanel::EditableComponent<String>("Project License (optional)", projectLicenseValue));
+        properties.add(new PropertiesPanel::comboComponent("Project License (optional)", projectLicenseValue), { "GPL-3.0-only", "GPL-3.0-or-later", "BSD-3-Clause", "MIT", "CC0-1.0", "Custom" });
         properties.add(new PropertiesPanel::ComboComponent("Export type", exportTypeValue, { "Binary", "Binary + GUI", "Source code", "Source + GUI code" }));
         properties.add(new PropertiesPanel::ComboComponent("Plugin type", pluginTypeValue, { "Effect", "Instrument", "Custom" }));
 
@@ -60,6 +60,8 @@ public:
         pluginTypeValue.addListener(this);
         midiinEnableValue.addListener(this);
         midioutEnableValue.addListener(this);
+
+        projectLicenseValue.addListener(this);
 
         panel.addSection("DPF", properties);
         panel.addSection("Plugin formats", pluginFormats);

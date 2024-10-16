@@ -7,18 +7,18 @@
 class DPFExporter : public ExporterBase {
 public:
     Value makerNameValue;
-    Value projectLicenseValue;
-    Value midiinEnableValue = Value(var(0));
-    Value midioutEnableValue = Value(var(0));
+    Value projectLicenseValue = SynchronousValue(var(0));
+    Value midiinEnableValue = SynchronousValue(var(0));
+    Value midioutEnableValue = SynchronousValue(var(0));
 
-    Value lv2EnableValue = Value(var(1));
-    Value vst2EnableValue = Value(var(1));
-    Value vst3EnableValue = Value(var(1));
-    Value clapEnableValue = Value(var(1));
-    Value jackEnableValue = Value(var(0));
+    Value lv2EnableValue = SynchronousValue(var(1));
+    Value vst2EnableValue = SynchronousValue(var(1));
+    Value vst3EnableValue = SynchronousValue(var(1));
+    Value clapEnableValue = SynchronousValue(var(1));
+    Value jackEnableValue = SynchronousValue(var(0));
 
-    Value exportTypeValue = Value(var(1));
-    Value pluginTypeValue = Value(var(1));
+    Value exportTypeValue = SynchronousValue(var(1));
+    Value pluginTypeValue = SynchronousValue(var(1));
 
     PropertiesPanelProperty* midiinProperty;
     PropertiesPanelProperty* midioutProperty;
@@ -28,7 +28,7 @@ public:
     {
         Array<PropertiesPanelProperty*> properties;
         properties.add(new PropertiesPanel::EditableComponent<String>("Maker Name (optional)", makerNameValue));
-        properties.add(new PropertiesPanel::comboComponent("Project License (optional)", projectLicenseValue), { "GPL-3.0-only", "GPL-3.0-or-later", "BSD-3-Clause", "MIT", "CC0-1.0", "Custom" });
+        properties.add(new PropertiesPanel::ComboComponent("Project License (optional)", projectLicenseValue, { "GPL-3.0-only", "GPL-3.0-or-later", "BSD-3-Clause", "MIT", "CC0-1.0", "Custom" }));
         properties.add(new PropertiesPanel::ComboComponent("Export type", exportTypeValue, { "Binary", "Binary + GUI", "Source code", "Source + GUI code" }));
         properties.add(new PropertiesPanel::ComboComponent("Plugin type", pluginTypeValue, { "Effect", "Instrument", "Custom" }));
 

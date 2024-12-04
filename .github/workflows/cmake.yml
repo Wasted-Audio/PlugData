@@ -22,7 +22,9 @@ jobs:
           key: macos
 
       - name: install jack
-        run: brew install jack
+        run: |
+          brew install jack
+          pkg-config --variable=includedir jack
 
       - name: Create Build Environment
         run: cmake -E make_directory ${{github.workspace}}/build
@@ -102,7 +104,9 @@ jobs:
           key: macos-legacy
 
       - name: install jack
-        run: brew install jack
+        run: |
+          brew install jack
+          pkg-config --variable=includedir jack
 
       - name: Create Build Environment
         run: cmake -E make_directory ${{github.workspace}}/build

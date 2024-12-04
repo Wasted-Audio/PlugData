@@ -331,6 +331,10 @@ include_directories(/usr/local/include)
 link_directories(/usr/local/lib)
 endif()
 
+if(APPLE)
+include_directories(/usr/local/include)
+endif()
+
 list(APPEND PLUGDATA_COMPILE_DEFINITIONS JUCE_MODAL_LOOPS_PERMITTED=1)
 
 list(APPEND PLUGDATA_INCLUDE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/Libraries/ELSE/sfont~/")

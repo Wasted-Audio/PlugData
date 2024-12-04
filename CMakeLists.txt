@@ -332,7 +332,11 @@ link_directories(/usr/local/lib)
 endif()
 
 if(APPLE)
-include_directories(/usr/local/include)
+  if(MACOS_LEGACY)
+    include_directories(/usr/local/include)
+  else()
+    include_directories(/opt/homebrew/include)
+  endif()
 endif()
 
 list(APPEND PLUGDATA_COMPILE_DEFINITIONS JUCE_MODAL_LOOPS_PERMITTED=1)

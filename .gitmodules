@@ -50,3 +50,6 @@
 	path = Libraries/melatonin_perfetto
 	url = https://github.com/sudara/melatonin_perfetto.git
 	branch = main
+[submodule "Libraries/jack"]
+	path = Libraries/jack
+	url = https://github.com/jackaudio/headers.git

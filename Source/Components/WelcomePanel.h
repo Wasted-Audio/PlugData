@@ -9,6 +9,7 @@
 #include "Utility/CachedTextRender.h"
 #include "Utility/NanoVGGraphicsContext.h"
 #include "Components/BouncingViewport.h"
+#include "Utility/PatchInfo.h"
 
 class WelcomePanel : public Component
     , public NVGComponent
@@ -121,13 +122,13 @@ class WelcomePanel : public Component
             
             auto lB = bounds.toFloat().expanded(0.5f);
             {
-                auto bgCol = !isHovered ? convertColour(findColour(PlugDataColour::canvasBackgroundColourId)) : convertColour(findColour(PlugDataColour::toolbarBackgroundColourId));
+                auto bgCol = !isHovered ? convertColour(findColour(PlugDataColour::panelForegroundColourId)) : convertColour(findColour(PlugDataColour::toolbarBackgroundColourId));
                 
                 // Draw border around
                 nvgDrawRoundedRect(nvg, lB.getX(), lB.getY(), lB.getWidth(), lB.getHeight(), bgCol, convertColour(findColour(PlugDataColour::toolbarOutlineColourId)), Corners::largeCornerRadius);
             }
             
-            auto const bgColour = findColour(PlugDataColour::canvasBackgroundColourId);
+            auto const bgColour = findColour(PlugDataColour::panelForegroundColourId);
             auto const bgCol = convertColour(bgColour);
             auto const newOpenIconCol = convertColour(bgColour.contrasting().withAlpha(0.32f));
             auto const iconSize = 48;
@@ -255,22 +256,22 @@ class WelcomePanel : public Component
         enum TileType
         {
             Patch,
-            Library
+            LibraryPatch
         };
 
         TileType tileType = Patch;
 
     public:
-        WelcomePanelTile(WelcomePanel& welcomePanel, File& patchFile, float scale, bool favourited, Image const& thumbImage = Image())
+        WelcomePanelTile(WelcomePanel& welcomePanel, File& patchFile, String patchAuthor, float scale, bool favourited, Image const& thumbImage = Image())
             : isFavourited(favourited)
             , parent(welcomePanel)
             , snapshotScale(scale)
             , thumbnailImageData(thumbImage)
+            , patchFile(patchFile)
         {
             tileName = patchFile.getFileNameWithoutExtension();
-
-            tileType = Library;
-
+            tileSubtitle = patchAuthor;
+            tileType = LibraryPatch;
             resized();
         }
 
@@ -282,7 +283,7 @@ class WelcomePanel : public Component
         {
             patchFile = File(subTree.getProperty("Path").toString());
             tileName = patchFile.getFileNameWithoutExtension();
-
+            
             auto is24Hour = OSUtils::is24HourTimeFormat();
 
             auto formatTimeDescription = [is24Hour](const Time& openTime, bool showDayAndDate = false) {
@@ -309,9 +310,9 @@ class WelcomePanel : public Component
 
             };
 
-            auto const accessedInPlugdasta = Time(static_cast<int64>(subTree.getProperty("Time")));
+            auto const accessedInPlugdata = Time(static_cast<int64>(subTree.getProperty("Time")));
 
-            tileSubtitle = formatTimeDescription(accessedInPlugdasta);
+            tileSubtitle = formatTimeDescription(accessedInPlugdata);
 
             auto const fileSize = patchFile.getSize();
 
@@ -329,7 +330,7 @@ class WelcomePanel : public Component
             // We need to show the time accessed from plugdata, which is saved in the settings XML
             // We want to show this again as well as in the subtile, but format it differently (with both Today/Yesterday and date)
             // because the popup menu may occlude the tile + subtitle
-            accessedTimeDescription = formatTimeDescription(accessedInPlugdasta, true);
+            accessedTimeDescription = formatTimeDescription(accessedInPlugdata, true);
 
             updateGeneratedThumbnailIfNeeded(thumbImage, svgImage);
         }
@@ -369,27 +370,70 @@ class WelcomePanel : public Component
 
             PopupMenu tileMenu;
 
-            tileMenu.addItem(PlatformStrings::getBrowserTip(), [this]() {
-                if (patchFile.existsAsFile())
-                    patchFile.revealToUser();
-            });
-            tileMenu.addSeparator();
-            tileMenu.addItem(isFavourited ? "Remove from favourites" : "Add to favourites", [this]() {
-                isFavourited = !isFavourited;
-                onFavourite(isFavourited);
-            });
-            tileMenu.addSeparator();
-            PopupMenu patchInfoSubMenu;
-            patchInfoSubMenu.addItem(String("Size: " + fileSizeDescription), false, false, nullptr);
-            patchInfoSubMenu.addSeparator();
-            patchInfoSubMenu.addItem(String("Created: " + creationTimeDescription), false, false, nullptr);
-            patchInfoSubMenu.addItem(String("Modified: " + modifiedTimeDescription), false, false, nullptr);
-            patchInfoSubMenu.addItem(String("Accessed: " + accessedTimeDescription), false, false, nullptr);
-            tileMenu.addSubMenu(String(tileName + ".pd file info"), patchInfoSubMenu, true);
-            tileMenu.addSeparator();
-            // TODO: we may want to be clearer about this - that it doesn't delete the file on disk
-            // Put this  at he bottom, so it's not accidentally clicked on
-            tileMenu.addItem("Remove from recently opened", onRemove);
+            if (tileType == LibraryPatch) {
+                tileMenu.addItem(PlatformStrings::getBrowserTip(), [this]() {
+                    if (patchFile.existsAsFile())
+                        patchFile.revealToUser();
+                });
+
+                tileMenu.addSeparator();
+
+                auto metaFile = patchFile.getParentDirectory().getChildFile("meta.json");
+                if(metaFile.existsAsFile()) {
+
+                    auto json = JSON::fromString(metaFile.loadFileAsString());
+                    auto patchInfo = PatchInfo(json);
+
+                    PopupMenu patchInfoSubMenu;
+                    patchInfoSubMenu.addItem("Title: " + patchInfo.title, false, false, nullptr);
+                    patchInfoSubMenu.addItem("Author: " + patchInfo.author, false, false, nullptr);
+                    patchInfoSubMenu.addItem("Released: " + patchInfo.releaseDate, false, false, nullptr);
+                    patchInfoSubMenu.addItem("About: " + patchInfo.description, false, false, nullptr);
+
+                    tileMenu.addSubMenu(String(tileName + " info"), patchInfoSubMenu, true);
+                } else {
+                    tileMenu.addItem("Patch info not provided", false, false, nullptr);
+                }
+
+                tileMenu.addSeparator();
+
+                // Put this at the bottom, so it's not accidentally clicked on
+                tileMenu.addItem("Delete from library...", [this]() {
+                    Dialogs::showMultiChoiceDialog(&parent.confirmationDialog, parent.getParentComponent(), "Are you sure you want to delete: " + patchFile.getFileNameWithoutExtension(), [this](int choice) {
+                        if (choice == 0) {
+                            patchFile.getParentDirectory().deleteRecursively(true);
+                            parent.triggerAsyncUpdate();
+                        }
+                    }, { "Yes", "No" }, Icons::Warning);
+                });
+            } else {
+                if (tileType == Patch) {
+                    tileMenu.addItem(PlatformStrings::getBrowserTip(), [this]() {
+                        if (patchFile.existsAsFile())
+                            patchFile.revealToUser();
+                    });
+
+                    tileMenu.addSeparator();
+                    tileMenu.addItem(isFavourited ? "Remove from favourites" : "Add to favourites", [this]() {
+                        isFavourited = !isFavourited;
+                        onFavourite(isFavourited);
+                    });
+
+                    tileMenu.addSeparator();
+                    PopupMenu patchInfoSubMenu;
+                    patchInfoSubMenu.addItem(String("Size: " + fileSizeDescription), false, false, nullptr);
+                    patchInfoSubMenu.addSeparator();
+                    patchInfoSubMenu.addItem(String("Created: " + creationTimeDescription), false, false, nullptr);
+                    patchInfoSubMenu.addItem(String("Modified: " + modifiedTimeDescription), false, false, nullptr);
+                    patchInfoSubMenu.addItem(String("Accessed: " + accessedTimeDescription), false, false, nullptr);
+                    tileMenu.addSubMenu(String(tileName + ".pd file info"), patchInfoSubMenu, true);
+                }
+                tileMenu.addSeparator();
+
+                // TODO: we may want to be clearer about this - that it doesn't delete the file on disk
+                // Put this  at he bottom, so it's not accidentally clicked on
+                tileMenu.addItem("Remove from recently opened", onRemove);
+            }
 
             PopupMenu::Options options;
             options.withTargetComponent(this);
@@ -447,7 +491,7 @@ class WelcomePanel : public Component
                     });
                 }
             } else {
-                if (tileType == Patch && snapshot && !snapshotImage.isValid()) {
+                if (tileType != LibraryPatch && snapshot && !snapshotImage.isValid()) {
                     snapshotImage = NVGImage(nvg, bounds.getWidth() * 2, (bounds.getHeight() - 32) * 2, [this](Graphics& g) {
                         g.addTransform(AffineTransform::scale(2.0f));
                         snapshot->drawAt(g, 0, 0, 1.0f);
@@ -461,7 +505,7 @@ class WelcomePanel : public Component
             
             auto lB = bounds.toFloat().expanded(0.5f);
             // Draw background even for images incase there is a transparent PNG
-            nvgDrawRoundedRect(nvg, lB.getX(), lB.getY(), lB.getWidth(), lB.getHeight(), convertColour(findColour(PlugDataColour::canvasBackgroundColourId)), convertColour(findColour(PlugDataColour::toolbarOutlineColourId)), Corners::largeCornerRadius);
+            nvgDrawRoundedRect(nvg, lB.getX(), lB.getY(), lB.getWidth(), lB.getHeight(), convertColour(findColour(PlugDataColour::panelForegroundColourId)), convertColour(findColour(PlugDataColour::toolbarOutlineColourId)), Corners::largeCornerRadius);
             if (thumbnailImageData.isValid()) {
                 // Render the thumbnail image file that is in the root dir of the pd patch
                 auto sB = bounds.toFloat().reduced(0.2f);
@@ -477,7 +521,7 @@ class WelcomePanel : public Component
                 nvgFontFace(nvg, "icon_font-Regular");
                 nvgFontSize(nvg, 68.0f);
                 nvgTextAlign(nvg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
-                nvgText(nvg, bounds.getCentreX(), (bounds.getHeight() - 30) * 0.5f, Icons::PlugdataIconStandard.toRawUTF8(), nullptr);
+                nvgText(nvg, bounds.getCentreX(), (bounds.getHeight() - 30) * 0.5f, tileType == LibraryPatch ? Icons::PlugdataIconStandard.toRawUTF8() : Icons::Error.toRawUTF8(), nullptr);
             }
 
             nvgRestore(nvg);
@@ -677,6 +721,9 @@ public:
                 auto const buttonY = getHeight() * 0.5f - 30;
                 newPatchTile->setBounds(rowBounds.withX(startX).withWidth(buttonWidth).withY(buttonY));
                 openPatchTile->setBounds(rowBounds.withX(startX + buttonWidth + tileSpacing).withWidth(buttonWidth).withY(buttonY));
+
+                auto firstTileBounds = rowBounds.removeFromLeft(actualTileWidth * 1.5f);
+                storeTile->setBounds(firstTileBounds);
             } else {
                 auto firstTileBounds = rowBounds.removeFromLeft(actualTileWidth * 1.5f);
                 newPatchTile->setBounds(firstTileBounds);
@@ -782,6 +829,16 @@ public:
 
                 auto subTree = recentlyOpenedTree.getChild(i);
                 auto patchFile = File(subTree.getProperty("Path").toString());
+                
+                if(!File(patchFile).existsAsFile())
+                {
+                    if(!subTree.hasProperty("Removable"))
+                    {
+                        recentlyOpenedTree.removeChild(subTree, nullptr);
+                    }
+                    continue;
+                }
+                
                 auto patchThumbnailBase = File(patchFile.getParentDirectory().getFullPathName() + "\\" + patchFile.getFileNameWithoutExtension() + "_thumb");
 
                 auto favourited = subTree.hasProperty("Pinned") && static_cast<bool>(subTree.getProperty("Pinned"));
@@ -874,7 +931,14 @@ public:
                         break;
                 }
             }
-            auto* tile = libraryTiles.add(new WelcomePanelTile(*this, patchFile, scale, false, thumbImage));
+            auto metaFile = patchFile.getParentDirectory().getChildFile("meta.json");
+            String author;
+            if(metaFile.existsAsFile())
+            {
+                auto json = JSON::fromString(metaFile.loadFileAsString());
+                author = json["Author"].toString();
+            }
+            auto* tile = libraryTiles.add(new WelcomePanelTile(*this, patchFile, author, scale, false, thumbImage));
             tile->onClick = [this, patchFile]() mutable {
                 if (patchFile.existsAsFile()) {
                     editor->pd->autosave->checkForMoreRecentAutosave(patchFile, editor, [this, patchFile]() {
@@ -958,6 +1022,8 @@ public:
     String searchQuery;
     Tab currentTab = Home;
     UnorderedMap<String, String> patchSvgCache;
+
+    std::unique_ptr<Dialog> confirmationDialog;
     
     // To make the library panel update automatically
     class LibraryFSListener : public FileSystemWatcher::Listener

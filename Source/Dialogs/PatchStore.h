@@ -1,4 +1,8 @@
 #include <random>
+#include "Utility/PatchInfo.h"
+
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include "Utility/stb_image_resize.h"
 
 
 class DownloadPool : public DeletedAtShutdown
@@ -7,8 +11,9 @@ public:
     struct DownloadListener
     {
         virtual void downloadProgressed(hash32 hash, float progress) {};
+        virtual void databaseDownloadCompleted(HeapArray<std::pair<PatchInfo, int>> const& patches) {};
         virtual void patchDownloadCompleted(hash32 hash, bool success) {};
-        virtual void imageDownloadCompleted(hash32 hash, Image const& image) {};
+        virtual void imageDownloadCompleted(hash32 hash, Image const& downloadedImage) {};
     };
     
     ~DownloadPool()
@@ -33,31 +38,105 @@ public:
         imagePool.removeAllJobs(true, 500);
     }
     
-    void downloadImage(hash32 hash, URL location)
+    void downloadDatabase()
     {
-        imagePool.addJob([this, hash, location](){
+        imagePool.addJob([this](){
+            SmallArray<PatchInfo> patches;
+            std::unique_ptr<WebInputStream> webstream;
+            
+            webstream = std::make_unique<WebInputStream>(URL("https://plugdata.org/store.json"), false);
+            webstream->connect(nullptr);
+            
+            if (webstream->isError() || webstream->getStatusCode() == 400) {
+                // TODO: show error
+                return;
+            }
+            
             MemoryBlock block;
-            // Load the image data from the URL
-            WebInputStream memstream(location, false);
-            memstream.readIntoMemoryBlock(block);
-            auto image = ImageFileFormat::loadFrom(block.getData(), block.getSize());
-            MessageManager::callAsync([this, hash, image](){
+            webstream->readIntoMemoryBlock(block);
+            MemoryInputStream memstream(block, false);
+            
+            auto parsedData = JSON::parse(memstream);
+            auto patchData = parsedData["Patches"];
+            if (patchData.isArray()) {
+                for (int i = 0; i < patchData.size(); ++i) {
+                    var const& patchObject = patchData[i];
+                    patches.add(PatchInfo(patchObject));
+                }
+            }
+            
+            HeapArray<std::pair<PatchInfo, int>> sortedPatches;
+            for(auto& patch : patches)
+            {
+                sortedPatches.emplace_back(patch, patch.isPatchInstalled() + (2 * patch.updateAvailable()));
+            }
+
+            std::sort(sortedPatches.begin(), sortedPatches.end(), [](std::pair<PatchInfo, int> const& first, std::pair<PatchInfo, int> const& second) {
+                auto& [patchA, flagsA] = first;
+                auto& [patchB, flagsB] = second;
+                
+                if(flagsA > flagsB) return true;
+                if(flagsA < flagsB) return false;
+
+                return patchA.releaseDate > patchB.releaseDate;
+            });
+
+            MessageManager::callAsync([this, sortedPatches]() {
                 for(auto& listener : listeners)
                 {
-                    listener->imageDownloadCompleted(hash, image);
+                    listener->databaseDownloadCompleted(sortedPatches);
                 }
             });
         });
     }
     
-    void downloadPatch(hash32 hash, URL location)
+    void downloadImage(hash32 hash, URL location)
     {
-        patchPool.addJob([this, hash, location](){
+        imagePool.addJob([this, hash, location](){
+            auto updateImageListeners = [this](hash32 hash, Image& image) {
+                MessageManager::callAsync([this, hash, image]() {
+                    for(auto& listener : listeners)
+                    {
+                        listener->imageDownloadCompleted(hash, image);
+                    }
+                });
+            };
+
+            static UnorderedMap<hash32, Image> downloadImageCache;
+            static CriticalSection cacheMutex;
+
+            {
+                ScopedLock lock(cacheMutex);
+
+                if (downloadImageCache.contains(hash)) {
+                    if (auto img = downloadImageCache[hash]; img.isValid()) {
+                        updateImageListeners(hash, img);
+                        return;
+                    }
+                }
+            }
+
+            MemoryBlock block;
+            // Load the image data from the URL
+            WebInputStream memstream(location, false);
+            memstream.readIntoMemoryBlock(block);
+            auto image = ImageFileFormat::loadFrom(block.getData(), block.getSize());
+            {
+                ScopedLock lock(cacheMutex);
+                downloadImageCache[hash] = image;
+            }
+            updateImageListeners(hash, image);
+        });
+    }
+    
+    void downloadPatch(hash32 downloadHash, PatchInfo const& info)
+    {
+        patchPool.addJob([this, downloadHash, info](){
             MemoryBlock data;
 
             int statusCode = 0;
             
-            auto instream = location.createInputStream(URL::InputStreamOptions(URL::ParameterHandling::inAddress)
+            auto instream = URL(info.download).createInputStream(URL::InputStreamOptions(URL::ParameterHandling::inAddress)
                                                        .withConnectionTimeoutMs(10000).withStatusCode(&statusCode));
             int64 totalBytes = instream->getTotalLength();
             int64 bytesDownloaded = 0;
@@ -74,21 +153,21 @@ public:
 
                 float progress = static_cast<long double>(bytesDownloaded) / static_cast<long double>(totalBytes);
                 
-                if(cancelledDownloads.contains(hash)) {
-                    cancelledDownloads.erase(hash);
-                    MessageManager::callAsync([this, hash]() mutable {
+                if(cancelledDownloads.contains(downloadHash)) {
+                    cancelledDownloads.erase(downloadHash);
+                    MessageManager::callAsync([this, downloadHash]() mutable {
                         for(auto& listener : listeners)
                         {
-                            listener->patchDownloadCompleted(hash, false);
+                            listener->patchDownloadCompleted(downloadHash, false);
                         }
                     });
                     return;
                 }
                 
-                MessageManager::callAsync([this, hash, progress]() mutable {
+                MessageManager::callAsync([this, downloadHash, progress]() mutable {
                     for(auto& listener : listeners)
                     {
-                        listener->downloadProgressed(hash, progress);
+                        listener->downloadProgressed(downloadHash, progress);
                     }
                 });
             }
@@ -96,7 +175,20 @@ public:
             MemoryInputStream input(data, false);
             ZipFile zip(input);
             
-            auto result = zip.uncompressTo(ProjectInfo::appDataDir.getChildFile("Patches"), true);
+            auto patchesDir = ProjectInfo::appDataDir.getChildFile("Patches");
+            auto result = zip.uncompressTo(patchesDir, true);
+            auto downloadedPatch = patchesDir.getChildFile(zip.getEntry(0)->filename);
+
+            auto targetLocation = downloadedPatch.getParentDirectory().getChildFile(info.getNameInPatchFolder());
+            targetLocation.deleteRecursively(true);
+
+            downloadedPatch.moveFileTo(targetLocation);
+            
+            auto metaFile = targetLocation.getChildFile("meta.json");
+            if(!metaFile.existsAsFile())
+            {
+                metaFile.replaceWithText(info.json);
+            }
             
             auto macOSTrash = ProjectInfo::appDataDir.getChildFile("Patches").getChildFile("__MACOSX");
             if(macOSTrash.isDirectory())
@@ -104,10 +196,10 @@ public:
                 macOSTrash.deleteRecursively();
             }
             
-            MessageManager::callAsync([this, hash, result](){
+            MessageManager::callAsync([this, downloadHash, result](){
                 for(auto& listener : listeners)
                 {
-                    listener->patchDownloadCompleted(hash, result.wasOk());
+                    listener->patchDownloadCompleted(downloadHash, result.wasOk());
                 }
             });
 
@@ -126,7 +218,7 @@ private:
     CriticalSection cancelledDownloadsLock;
     UnorderedSet<hash32> cancelledDownloads;
     
-    ThreadPool imagePool = ThreadPool(2);
+    ThreadPool imagePool = ThreadPool(3);
     ThreadPool patchPool = ThreadPool(2);
     
 public:
@@ -157,7 +249,7 @@ public:
     void imageDownloadCompleted(hash32 hash, Image const& image) override {
         if(hash == imageHash)
         {
-            downloadedImage = image;
+            scaledImage = resampleImageToFit(image);
             repaint();
             spinner.stopSpinning();
         }
@@ -167,12 +259,13 @@ public:
     void setImageURL(const URL& url)
     {
         imageHash = hash(url.toString(false));
-        downloadedImage = Image();
+        scaledImage = Image();
 
         // Lock the thread to safely update the image URL
         imageURL = url;
         DownloadPool::getInstance()->downloadImage(imageHash, url);
         spinner.startSpinning();
+
         repaint();
     }
 
@@ -182,7 +275,7 @@ public:
         Path roundedRectanglePath;
         roundedRectanglePath.addRoundedRectangle(0, 0, getWidth(), getHeight(), Corners::largeCornerRadius, Corners::largeCornerRadius, roundTop, roundTop, roundBottom, roundBottom);
 
-        if (!downloadedImage.isValid()) {
+        if (!scaledImage.isValid()) {
             g.setColour(findColour(PlugDataColour::panelForegroundColourId));
             g.fillPath(roundedRectanglePath);
             return;
@@ -190,72 +283,210 @@ public:
 
         g.saveState();
 
-        // Set the path as the clip region for the Graphics context
         g.reduceClipRegion(roundedRectanglePath);
 
-        float scaleX = static_cast<float>(getWidth()) / downloadedImage.getWidth();
-        float scaleY = static_cast<float>(getHeight()) / downloadedImage.getHeight();
-        float scale = jmax(scaleX, scaleY);
+        Rectangle<float> targetBounds(0, 0, static_cast<float>(getWidth()), static_cast<float>(getHeight()));
 
-        // Calculate the translation values to keep the image centered
-        float translateX = (getWidth() - downloadedImage.getWidth() * scale) * 0.5f;
-        float translateY = (getHeight() - downloadedImage.getHeight() * scale) * 0.5f;
-
-        // Apply the transformation to the Graphics context
-        g.addTransform(AffineTransform::translation(translateX, translateY).scaled(scale));
-
-        // Apply the transformation to the Graphics context
-        g.drawImage(downloadedImage, 0, 0, downloadedImage.getWidth(), downloadedImage.getHeight(), 0, 0, downloadedImage.getWidth(), downloadedImage.getHeight());
+        g.setImageResamplingQuality(Graphics::highResamplingQuality);
+        g.drawImage(scaledImage, targetBounds, RectanglePlacement::centred | RectanglePlacement::fillDestination);
 
         g.restoreState();
+    }
+
+    Image resampleImageToFit(Image const& downloadedImage)
+    {
+        Image result;
+#if JUCE_MAC
+        if (downloadedImage.isValid())
+        {
+            auto srcWidth = downloadedImage.getWidth();
+            auto srcHeight = downloadedImage.getHeight();
+
+            int targetWidth = getWidth();
+            int targetHeight = getHeight();
+
+            // Calculate the aspect ratios
+            float srcAspect = static_cast<float>(srcWidth) / static_cast<float>(srcHeight);
+            float targetAspect = static_cast<float>(targetWidth) / static_cast<float>(targetHeight);
+
+            // Crop the image to match the target aspect ratio
+            int cropX = 0, cropY = 0, cropWidth = srcWidth, cropHeight = srcHeight;
+
+            if (srcAspect > targetAspect) {
+                // Image is wider than the target, crop width
+                cropWidth = static_cast<int>(srcHeight * targetAspect);
+                cropX = (srcWidth - cropWidth) / 2;  // Center the crop
+            } else if (srcAspect < targetAspect) {
+                // Image is taller than the target, crop height
+                cropHeight = static_cast<int>(srcWidth / targetAspect);
+                cropY = (srcHeight - cropHeight) / 2;  // Center the crop
+            }
+
+            // Resample the image to the new size
+            result = downloadedImage.getClippedImage(Rectangle<int>(cropX, cropY, cropWidth, cropHeight));
+        }
+#else
+        if (!downloadedImage.isValid())
+            return result;
+
+        auto srcWidth = downloadedImage.getWidth();
+        auto srcHeight = downloadedImage.getHeight();
+
+        int targetWidth = getWidth() * scale;
+        int targetHeight = getHeight() * scale;
+
+        // Calculate the aspect ratios
+        float srcAspect = static_cast<float>(srcWidth) / static_cast<float>(srcHeight);
+        float targetAspect = static_cast<float>(targetWidth) / static_cast<float>(targetHeight);
+
+        // Crop the image to match the target aspect ratio
+        int cropX = 0, cropY = 0, cropWidth = srcWidth, cropHeight = srcHeight;
+
+        if (srcAspect > targetAspect) {
+            // Image is wider than the target, crop width
+            cropWidth = static_cast<int>(srcHeight * targetAspect);
+            cropX = (srcWidth - cropWidth) / 2;  // Center the crop
+        } else if (srcAspect < targetAspect) {
+            // Image is taller than the target, crop height
+            cropHeight = static_cast<int>(srcWidth / targetAspect);
+            cropY = (srcHeight - cropHeight) / 2;  // Center the crop
+        }
+
+        int numChannels = 0;
+        auto srcData = packImageData(downloadedImage.getClippedImage(Rectangle<int>(cropX, cropY, cropWidth, cropHeight)), numChannels);
+
+        HeapArray<unsigned char> resampledData(targetWidth * targetHeight * numChannels);
+
+        // Perform resampling
+//#define CUSTOM_FILTER
+#ifdef CUSTOM_FILTER
+        stbir_resize_uint8_generic(
+            srcData.data(), cropWidth, cropHeight, 0, // Source image
+            resampledData.data(), targetWidth, targetHeight, 0, // Destination image
+            numChannels, // Number of channels
+            numChannels == 4,
+            1,
+            STBIR_EDGE_CLAMP,
+            STBIR_FILTER_DEFAULT,
+            STBIR_COLORSPACE_SRGB,
+            NULL
+        );
+#else
+        stbir_resize_uint8(
+            srcData.data(), cropWidth, cropHeight, 0, // Source image
+            resampledData.data(), targetWidth, targetHeight, 0, // Destination image
+            numChannels // Number of channels
+        );
+#endif
+
+        result = Image(downloadedImage.getFormat(), targetWidth, targetHeight, true);
+        Image::BitmapData destData(result, Image::BitmapData::writeOnly);
+
+        for (int y = 0; y < targetHeight; ++y)
+        {
+            unsigned char* destRow = destData.getLinePointer(y);
+            std::memcpy(destRow, &resampledData[y * targetWidth * numChannels], targetWidth * numChannels);
+        }
+#endif
+        
+        return result;
+    }
+
+    static HeapArray<unsigned char> packImageData(const Image &image, int &numChannels)
+    {
+        if (!image.isValid())
+            return {};
+
+        Image::BitmapData bitmapData(image, Image::BitmapData::readOnly);
+
+        // Determine the number of channels
+        switch (image.getFormat()) {
+            case Image::PixelFormat::RGB:
+                numChannels = 3;
+                break;
+            case Image::PixelFormat::ARGB:
+                numChannels = 4;
+                break;
+            case Image::PixelFormat::SingleChannel:
+                numChannels = 1;
+                break;
+            default:
+                return {};
+        }
+
+        // Allocate tightly packed buffer
+        int width = image.getWidth();
+        int height = image.getHeight();
+        HeapArray<unsigned char> packedData(width * height * numChannels);
+
+        for (int y = 0; y < height; ++y) {
+            const unsigned char *row = bitmapData.getLinePointer(y);
+
+            for (int x = 0; x < width; ++x) {
+                int srcIndex = x * bitmapData.pixelStride;
+                int destIndex = (y * width + x) * numChannels;
+
+                // Pack based on format
+                switch (image.getFormat()) {
+                    case Image::ARGB: {
+                        packedData[destIndex + 0] = row[srcIndex + 1]; // Red
+                        packedData[destIndex + 1] = row[srcIndex + 2]; // Green
+                        packedData[destIndex + 2] = row[srcIndex + 3]; // Blue
+                        if (numChannels == 4)
+                            packedData[destIndex + 0] = row[srcIndex + 3]; // Alpha
+                    }
+                    break;
+                    case Image::RGB: {
+                        packedData[destIndex + 0] = row[srcIndex + 0]; // Red
+                        packedData[destIndex + 1] = row[srcIndex + 1]; // Green
+                        packedData[destIndex + 2] = row[srcIndex + 2]; // Blue
+                    }
+                    break;
+                    case Image::SingleChannel: {
+                        packedData[destIndex] = row[srcIndex];
+                    }
+                    break;
+                    default:
+                    break;
+
+                }
+            }
+        }
+
+        return packedData;
     }
 
     void resized() override
     {
         spinner.setCentrePosition(getWidth() / 2, getHeight() / 2);
     }
+    
+    static void setScreenScale(float scaleFactor)
+    {
+        scale = scaleFactor;
+    }
 
 private:
     bool roundTop, roundBottom;
     URL imageURL;
     hash32 imageHash;
-    Image downloadedImage;
+    Image scaledImage;
     Spinner spinner;
+    
+    static inline float scale = 0.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(OnlineImage)
 };
 
-class PatchInfo {
-public:
-    String title;
-    String author;
-    String releaseDate;
-    String download;
-    String description;
-    String price;
-    String thumbnailUrl;
-    String size;
-
-    PatchInfo() = default;
-    
-    PatchInfo(var const& jsonData)
-    {
-        title = jsonData["Title"];
-        author = jsonData["Author"];
-        releaseDate = jsonData["Release date"];
-        download = jsonData["Download"];
-        description = jsonData["Description"];
-        price = jsonData["Price"];
-        thumbnailUrl = jsonData["StoreThumb"];
-    }
-};
 
 class PatchDisplay : public Component {
 public:
-    PatchDisplay(PatchInfo const& patchInfo, std::function<void(PatchInfo const&)> clickCallback)
+    PatchDisplay(PatchInfo const& patchInfo, std::function<void(PatchInfo const&)> clickCallback, int statusFlag)
         : image(true, false)
         , callback(clickCallback)
         , info(patchInfo)
+        , isInstalled(statusFlag >= 1)
+        , needsUpdate(statusFlag >= 2)
     {
         image.setImageURL("https://plugdata.org/thumbnails/png/" + patchInfo.thumbnailUrl + ".png");
         addAndMakeVisible(image);
@@ -317,8 +548,15 @@ private:
 
         layout.draw(g, textBounds.withTrimmedBottom(32).toFloat());
 
-        auto priceArea = b.removeFromBottom(32).reduced(11);
-        Fonts::drawStyledText(g, info.price, priceArea, textColour, Semibold, 15, Justification::centredLeft);
+        auto bottomRow = b.removeFromBottom(32).reduced(11);
+        Fonts::drawStyledText(g, info.price, bottomRow, textColour, Semibold, 15, Justification::centredLeft);
+        
+        if(needsUpdate){
+            Fonts::drawStyledText(g, "Update available", bottomRow, textColour, Semibold, 15, Justification::centredRight);
+        }
+        if(isInstalled) {
+            Fonts::drawStyledText(g, "Installed", bottomRow, textColour, Semibold, 15, Justification::centredRight);
+        }
     }
 
     void resized() override
@@ -346,33 +584,21 @@ private:
 
     std::function<void(PatchInfo const&)> callback;
     PatchInfo info;
+    bool isInstalled;
+    bool needsUpdate;
 };
 
 class PatchContainer : public Component
-    , public AsyncUpdater {
+{
     int const displayWidth = 260;
     int const displayHeight = 315;
 
     OwnedArray<PatchDisplay> patchDisplays;
-    std::mutex patchesMutex;
-    SmallArray<PatchInfo> patches;
+    HeapArray<std::pair<PatchInfo, int>> patches;
    
 public:
         
     std::function<void(PatchInfo const&)> patchClicked;
-
-    void handleAsyncUpdate() override
-    {
-        patchDisplays.clear();
-
-        for (auto& patch : patches) {
-            auto* display = patchDisplays.add(new PatchDisplay(patch, patchClicked));
-            addAndMakeVisible(display);
-        }
-
-        setSize(getWidth(), ((patches.size() / (getWidth() / displayWidth)) * (displayHeight + 8)) + 12);
-        resized(); // Even if size if the same, we still want to call resize
-    }
 
     void filterPatches(String query)
     {
@@ -387,12 +613,19 @@ public:
         resized();
     }
 
-    void showPatches(SmallArray<PatchInfo> const& patchesToShow)
+    void showPatches(HeapArray<std::pair<PatchInfo, int>> const& patchesToShow)
     {
-        patchesMutex.lock();
         patches = patchesToShow;
-        patchesMutex.unlock();
-        triggerAsyncUpdate();
+        
+        patchDisplays.clear();
+
+        for (auto& patch : patches) {
+            auto* display = patchDisplays.add(new PatchDisplay(patch.first, patchClicked, patch.second));
+            addAndMakeVisible(display);
+        }
+
+        setSize(getWidth(), ((patches.size() / (getWidth() / displayWidth)) * (displayHeight + 8)) + 12);
+        resized(); // Even if size if the same, we still want to call resize
     }
 
     void resized() override
@@ -420,7 +653,7 @@ public:
         }
     }
     
-    SmallArray<PatchInfo> getPatches()
+    HeapArray<std::pair<PatchInfo, int>> getPatches()
     {
         return patches;
     }
@@ -446,6 +679,7 @@ class PatchFullDisplay : public Component, public DownloadPool::DownloadListener
     public:
         enum Type
         {
+            AlreadyInstalled,
             Download,
             Store,
             View,
@@ -461,6 +695,7 @@ class PatchFullDisplay : public Component, public DownloadPool::DownloadListener
         
         String getIcon()
         {
+            if(type == AlreadyInstalled) return isMouseOver() ? Icons::Reset : Icons::Checkmark;
             if(type == Download) return Icons::Download;
             if(type == Store) return Icons::Store;
             if(type == View) return Icons::Info;
@@ -470,6 +705,7 @@ class PatchFullDisplay : public Component, public DownloadPool::DownloadListener
         
         String getText()
         {
+            if(type == AlreadyInstalled) return isMouseOver() ? "Reinstall" : "Installed";
             if(type == Download) return "Download";
             if(type == Store) return "View in store";
             if(type == View) return "View online";
@@ -549,11 +785,10 @@ public:
             if(downloadProgress == 0)
             {
                 repaint();
-                
-                auto fileName = URL(currentPatch.download).getFileName();
-                if (fileName.endsWith(".zip") || fileName.endsWith(".plugdata")) {
+
+                if (currentPatch.isPatchArchive()) {
                     downloadProgress = 1;
-                    DownloadPool::getInstance()->downloadPatch(patchHash, currentPatch.download);
+                    DownloadPool::getInstance()->downloadPatch(patchHash, currentPatch);
                 }
                 else {
                     URL(currentPatch.download).launchInDefaultBrowser();
@@ -576,29 +811,26 @@ public:
         DownloadPool::getInstance()->removeDownloadListener(this);
     }
     
-    void downloadProgressed(hash32 hash, float progress) override {
-        if(hash == patchHash) {
+    void downloadProgressed(hash32 downloadHash, float progress) override {
+        if(downloadHash == patchHash) {
             downloadButton.setType(LinkButton::Cancel);
             downloadProgress = std::max<int>(progress * 100, 1);
             repaint();
         }
     };
     
-    void patchDownloadCompleted(hash32 hash, bool success) override {
-        if(hash == patchHash) {
+    void patchDownloadCompleted(hash32 downloadHash, bool success) override {
+        if(downloadHash == patchHash) {
             downloadProgress = 0;
-            auto fileName = URL(currentPatch.download).getFileName();
-            auto fileNameWithoutExtension = fileName.upToLastOccurrenceOf(".", false, false);
             auto* parent = viewport.getParentComponent();
-            if(success)
-            {
-                Dialogs::showMultiChoiceDialog(&confirmationDialog, parent, "Successfully installed " + fileNameWithoutExtension, [](int){}, { "Dismiss" }, Icons::Checkmark);
+            if(success) {
+                Dialogs::showMultiChoiceDialog(&confirmationDialog, parent, "Successfully installed " + currentPatch.title, [](int){}, { "Dismiss" }, Icons::Checkmark);
             }
             else {
-                Dialogs::showMultiChoiceDialog(&confirmationDialog, parent, "Failed to install " + fileNameWithoutExtension, [](int){}, { "Dismiss" });
+                Dialogs::showMultiChoiceDialog(&confirmationDialog, parent, "Failed to install " + currentPatch.title, [](int){}, { "Dismiss" });
             }
             
-            downloadButton.setType(LinkButton::Download);
+            downloadButton.setType(success ? LinkButton::AlreadyInstalled : LinkButton::Download);
         }
     };
     
@@ -607,15 +839,17 @@ public:
         return viewport;
     }
 
-    void showPatch(PatchInfo const& patchInfo, SmallArray<PatchInfo> const& allPatches)
-    {
+    void showPatch(PatchInfo const& patchInfo, HeapArray<std::pair<PatchInfo, int>> const& allPatches) {
         downloadProgress = 0;
         patchHash = hash(patchInfo.title);
         patches = allPatches;
         currentPatch = patchInfo;
 
         auto fileName = URL(currentPatch.download).getFileName();
-        if (fileName.endsWith(".zip") || fileName.endsWith(".plugdata")) {
+
+        if (currentPatch.isPatchInstalled()) {
+            downloadButton.setType(LinkButton::AlreadyInstalled);
+        } else if (currentPatch.isPatchArchive()) {
             downloadButton.setType(LinkButton::Download);
         } else {
             downloadButton.setType(LinkButton::Store);
@@ -627,17 +861,17 @@ public:
         morePatches.showPatches(filterPatches(patchInfo, allPatches));
     }
     
-    SmallArray<PatchInfo> filterPatches(PatchInfo const& targetPatch, SmallArray<PatchInfo> toFilter)
+    HeapArray<std::pair<PatchInfo, int>> filterPatches(PatchInfo const& targetPatch, HeapArray<std::pair<PatchInfo, int>> toFilter)
     {
         std::shuffle(std::begin(toFilter), std::end(toFilter), std::random_device());
         
-        SmallArray<PatchInfo> result;
-        for(auto& patch : toFilter)
+        HeapArray<std::pair<PatchInfo, int>> result;
+        for(auto& [patch, flags] : toFilter)
         {
             if(result.size() >= 3) break;
-            if(targetPatch.author == patch.author && patch.title != targetPatch.title)
+            if(flags == 0 && targetPatch.author == patch.author && patch.title != targetPatch.title)
             {
-                result.add(patch);
+                result.add({patch, 0});
             }
         }
         
@@ -645,10 +879,10 @@ public:
         {
             result.clear();
             
-            for(auto& patch : toFilter)
+            for(auto& [patch, flags] : toFilter)
             {
                 if(result.size() >= 3) break;
-                if(patch.title != targetPatch.title) result.add(patch);
+                if(flags == 0 && patch.title != targetPatch.title) result.add({patch, 0});
             }
         }
         
@@ -783,12 +1017,10 @@ public:
     
     int downloadProgress = 0;
     std::unique_ptr<Dialog> confirmationDialog;
-    SmallArray<PatchInfo> patches;
+    HeapArray<std::pair<PatchInfo, int>> patches;
 };
 
-struct PatchStore : public Component
-    , public AsyncUpdater
-    , public Thread {
+struct PatchStore : public Component, public DownloadPool::DownloadListener {
     
     PatchContainer patchContainer;
     BouncingViewport contentViewport;
@@ -803,7 +1035,6 @@ struct PatchStore : public Component
         
 public:
     PatchStore()
-        : Thread("PatchStore API Thread")
     {
         contentViewport.setViewedComponent(&patchContainer, false);
         patchContainer.setVisible(true);
@@ -812,7 +1043,7 @@ public:
         contentViewport.setScrollBarsShown(true, false, true, false);
 
         spinner.startSpinning();
-        startThread();
+        DownloadPool::getInstance()->downloadDatabase();
 
         addChildComponent(patchFullDisplay.getViewport());
 
@@ -858,7 +1089,7 @@ public:
         refreshButton.onClick = [this]() {
             DownloadPool::getInstance()->cancelImageDownloads();
             spinner.startSpinning();
-            startThread();
+            DownloadPool::getInstance()->downloadDatabase();
             refreshButton.setEnabled(false);
         };
 
@@ -881,16 +1112,19 @@ public:
         };
         addChildComponent(input);
         addChildComponent(spinner);
+        DownloadPool::getInstance()->addDownloadListener(this);
     }
 
     ~PatchStore()
     {
+        DownloadPool::getInstance()->removeDownloadListener(this);
         DownloadPool::getInstance()->cancelImageDownloads();
-        waitForThreadToExit(-1);
     }
         
     void paint(Graphics& g) override
     {
+        OnlineImage::setScreenScale(g.getInternalContext().getPhysicalPixelScaleFactor());
+        
         g.setColour(findColour(PlugDataColour::panelBackgroundColourId));
         g.fillRoundedRectangle(getLocalBounds().toFloat(), Corners::windowCornerRadius);
 
@@ -927,43 +1161,9 @@ public:
         spinner.setSize(50, 50);
         spinner.setCentrePosition(b.getWidth() / 2, b.getHeight() / 2);
     }
-
-    void run() override
-    {
-        SmallArray<PatchInfo> patches;
-        std::unique_ptr<WebInputStream> webstream;
         
-        webstream = std::make_unique<WebInputStream>(URL("https://plugdata.org/store.json"), false);
-        webstream->connect(nullptr);
-        
-        if (webstream->isError() || webstream->getStatusCode() == 400) {
-            // TODO: show error
-            return;
-        }
-        
-        MemoryBlock block;
-        webstream->readIntoMemoryBlock(block);
-        MemoryInputStream memstream(block, false);
-        
-        auto parsedData = JSON::parse(memstream);
-        auto patchData = parsedData["Patches"];
-        if (patchData.isArray()) {
-            for (int i = 0; i < patchData.size(); ++i) {
-                var const& patchObject = patchData[i];
-                patches.add(PatchInfo(patchObject));
-            }
-        }
-        
-        std::sort(patches.begin(), patches.end(), [](PatchInfo const& first, PatchInfo const& second) {
-            return first.releaseDate > second.releaseDate;
-        });
-        
+    void databaseDownloadCompleted(HeapArray<std::pair<PatchInfo, int>> const& patches) override {
         patchContainer.showPatches(patches);
-        triggerAsyncUpdate();
-    }
-
-    void handleAsyncUpdate() override
-    {
         refreshButton.setEnabled(true);
         spinner.stopSpinning();
     }

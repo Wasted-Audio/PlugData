@@ -175,6 +175,12 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Install winget
+        uses: Cyberboss/install-winget@v1
+
+      - name: Install jack
+        run: winget install jack2 --disable-interactivity --accept-source-agreements
+
       - name: Create Build Environment
         run: cmake -E make_directory ${{github.workspace}}/build
 
@@ -229,6 +235,12 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+
+      - name: Install winget
+        uses: Cyberboss/install-winget@v1
+
+      - name: Install jack
+        run: winget install jack2 --disable-interactivity --accept-source-agreements
 
       - name: Create Build Environment
         run: cmake -E make_directory ${{github.workspace}}/build
